@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Upload Open File to Development Server",
+            "type": "shell",
+            "command": "curl",
+            "args": [
+                "-k",
+                "--key",
+                "${workspaceFolder}/.vscode/id_rsa",
+                "-T",
+                "${file}",
+                "sftp://${config:RUST_SERVER_USERNAME}@${config:RUST_SERVER_HOST}:${config:RUST_SERVER_PORT}${config:RUST_SERVER_PATH}"
+            ],
+            "problemMatcher": [],
+            "group": {
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Setup Workspace Windows",
+            "type": "shell",
+            "command": "${workspaceFolder}/setup.ps1"
+        }
+    ]
+}

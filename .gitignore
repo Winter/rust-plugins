@@ -1,0 +1,24 @@
+*
+
+# Git
+!/.github/
+!/.github/**/*
+!/.gitignore
+!/CHANGELOG.md
+!/LICENSE.md
+!/README.md
+
+# Source Directories
+!/src
+
+# Source Files
+!/src/*.cs
+
+# VS Code
+!/.editorconfig
+!/.vscode
+!/.vscode/launch.json
+!/.vscode/tasks.json
+
+!/rust-plugins.csproj
+!/setup.ps1
