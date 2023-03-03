@@ -35,16 +35,29 @@ public class YeetPlugin : CarbonPlugin
 
     public async Task Loaded()
     {
-        _client = new RedisClient(this, _config.Host, _config.Port, _config.Password)
+        _client = new RedisClient(_config.Host, _config.Port, _config.Password)
         {
             MaximumQueueSize = _config.MaximumQueueSize,
-            ReconnectionDelay = TimeSpan.FromMilliseconds(_config.ReconnectionDelayMilliseconds),
-            DequeueDelay = TimeSpan.FromMilliseconds(_config.DequeueDelayMilliseconds)
+            ConnectionDelay = TimeSpan.FromMilliseconds(_config.ConnectionDelayMs),
+            DequeueDelay = TimeSpan.FromMilliseconds(_config.DequeueDelayMs)
+        };
+
+        _client.OnConnected += () =>
+        {
+            Puts($"RedisClient: Connected to {_config.Host}:{_config.Port}");
+        };
+
+        _client.OnAuthenticated += () =>
+        {
+            Puts($"RedisClient: Authenticated");
+        };
+
+        _client.OnDisconnected += () =>
+        {
+            Puts($"RedisClient: Disconnected from {_config.Host}:{_config.Port}");
         };
 
         await _client.ConnectAsync();
-
-        Puts("Connected!");
     }
 
     public void Unload()
@@ -59,8 +72,8 @@ public class YeetPlugin : CarbonPlugin
         public int Port = 6379;
         public string Password = "";
         public int MaximumQueueSize = 100000;
-        public int ReconnectionDelayMilliseconds = 5000;
-        public int DequeueDelayMilliseconds = 50;
+        public int ConnectionDelayMs = 5000;
+        public int DequeueDelayMs = 50;
 
         public static bool Validate(CarbonPlugin plugin, PluginConfig config)
         {
@@ -100,156 +113,233 @@ public class YeetPlugin : CarbonPlugin
     }
 }
 
+/// <summary>
+///     Represents a Redis client that can execute Redis commands over a network connection.
+/// </summary>
 public class RedisClient : IDisposable
 {
-    private readonly CarbonPlugin _plugin;
     private readonly string _host;
     private readonly int _port;
     private readonly string _password;
 
-    private TcpClient _client;
-    private NetworkStream _stream;
-    private StreamWriter _writer;
-
-    private readonly CancellationTokenSource _cancellationSource;
     private readonly ConcurrentQueue<string> _queue;
 
+    private CancellationTokenSource _cancellationTokenSource;
+    private TcpClient _client;
+    private NetworkStream _stream;
     private bool _disposed;
     private bool _running;
 
     public int MaximumQueueSize { get; set; } = 100000;
-    public TimeSpan ReconnectionDelay { get; set; } = TimeSpan.FromSeconds(5);
+    public TimeSpan ConnectionDelay { get; set; } = TimeSpan.FromSeconds(5);
     public TimeSpan DequeueDelay { get; set; } = TimeSpan.FromMilliseconds(50);
 
+    /// <summary>
+    ///     Occurs when the Redis client successfully connects
+    /// </summary>
+    public event Action OnConnected;
+
+    /// <summary>
+    ///     Occurs when the Redis client successfully authenticated
+    /// </summary>
+    /// 
+    public event Action OnAuthenticated;
+
+    /// <summary>
+    ///     Occurs when the Redis client is disconnected 
+    /// </summary>
+    public event Action OnDisconnected;
+
+    /// <summary>
+    /// Occurs when an error occurs in the Redis client
+    /// </summary>    
+    public event Action<Exception> OnError;
+
+    /// <summary>
+    ///     Initializes a new instance of RedisClient with the specified host and port number.
+    /// </summary>
+    /// <param name="host">The hostname or IP address of the Redis server.</param>
+    /// <param name="port">The port number on which the Redis server is listening.</param>
     public RedisClient(
-        CarbonPlugin plugin,
         string host,
         int port,
         string password)
     {
-        _plugin = plugin;
         _host = host;
         _port = port;
         _password = password;
-
-        _cancellationSource = new CancellationTokenSource();
         _queue = new ConcurrentQueue<string>();
     }
 
-    public Task EnsureConnected()
-    {
-        if (_client == null || !_client.Connected)
-        {
-            return ConnectAsync();
-        }
-
-        return Task.CompletedTask;
-    }
-
+    /// <summary>
+    ///     Connects the Redis client to the Redis server.
+    /// </summary>
+    /// <returns>A task that represents the asynchronous connect operation.</returns>
     public async Task ConnectAsync()
     {
-        if (_disposed)
-        {
-            throw new ObjectDisposedException(nameof(RedisClient));
-        }
+        _cancellationTokenSource = new CancellationTokenSource();
 
-        if (_client != null && _client.Connected)
-        {
-            return;
-        }
-
-        while (!_cancellationSource.IsCancellationRequested)
+        while (!_cancellationTokenSource.IsCancellationRequested)
         {
             try
             {
-                _client?.Dispose();
                 _client = new TcpClient();
-
                 await _client.ConnectAsync(_host, _port);
-
                 _stream = _client.GetStream();
-                _writer = new StreamWriter(_stream)
-                {
-                    AutoFlush = true
-                };
 
-                if (_password != null)
+                if (_password is not null)
                 {
-                    // We don't want to queue our auth command as 
-                    await SendCommandAsync("AUTH", _password);
+                    // Send our password to the Redis server
+                    var result = await ExecuteAsync("AUTH", _password);
+
+                    if (result.StartsWith("+OK"))
+                    {
+                        OnAuthenticated?.Invoke();
+                    }
+                    else if (result.StartsWith("-ERR"))
+                    {
+                        OnError?.Invoke(new Exception(result));
+
+                        // Wait some time before trying to connect again
+                        await Task.Delay(ConnectionDelay);
+                        continue;
+                    }
                 }
 
+                // We're likely coming from ReconnectAsync. Don't start the SendMessagesAsync loop again.
                 if (!_running)
                 {
-                    // Unsure if this is fine. Carbon doesn't seem to let us use Task.Run.
-                    // I feel as if there's some fuckery with SyncronizationContext's
-                    _ = BeginSendAsync(_cancellationSource.Token);
+                    // Start sending messages from our queue in the background
+                    _ = SendMessagesAsync();
                 }
+
+                OnConnected?.Invoke();
 
                 return;
             }
-            catch (TaskCanceledException)
+            catch (SocketException)
             {
-                if (!_disposed)
-                {
-                    _plugin.Puts($"A TaskCanceledException occurred yet we're not disposing?");
-                }
-            }
-            catch (Exception ex)
-            {
-                _plugin.Puts($"An exception occurred while attempting to connect to {_host}:{_port}:\n{ex}");
-                await Task.Delay(ReconnectionDelay);
+                // Wait some time before trying to connect again
+                await Task.Delay(ConnectionDelay);
             }
         }
     }
 
-    public async Task BeginSendAsync(CancellationToken cancellationToken)
+    public async Task SendMessagesAsync()
     {
-        if (_disposed)
-        {
-            throw new ObjectDisposedException(nameof(RedisClient));
-        }
-
         _running = true;
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!_cancellationTokenSource.IsCancellationRequested)
         {
-            try
+            // Apparently, while loops treat their scope like a for loop
+            while (_queue.TryDequeue(out var message))
             {
-                await EnsureConnected();
+                try
+                {
+                    // Send our message
+                    await SendAsync(message);
+                }
+                catch (IOException)
+                {
+                    // We've encountered a snag. Attempt to reconnect.
+                    await ReconnectAsync();
+                }
+            }
 
-                if (_queue.TryDequeue(out var respCommand))
-                {
-                    await _writer.WriteAsync(respCommand);
-                }
-                else
-                {
-                    await Task.Delay(DequeueDelay, cancellationToken);
-                }
-            }
-            catch (TaskCanceledException)
-            {
-                if (!_disposed)
-                {
-                    _plugin.Puts($"A TaskCanceledException occurred yet we're not disposing?");
-                }
-            }
-            catch (Exception ex)
-            {
-                _plugin.Puts($"An exception occurred while attempting to send command to {_host}:{_port}:\n{ex}");
-                await Task.Delay(ReconnectionDelay, cancellationToken);
-            }
+            // We've reached the end of our queue. Let's wait.
+            await Task.Delay(DequeueDelay);
         }
     }
 
-    public async Task SendCommandAsync(string command, params string[] args)
+    /// <summary>
+    ///     Receive a response from the Redis server
+    /// </summary>
+    /// <returns>A task that represents the asynchronous receive operation. The result of the task is the Redis server's response</returns>
+    /// <exception cref="EndOfStreamException" />
+    public async Task<string> ReceiveResponseAsync()
     {
-        await EnsureConnected();
+        var buffer = new byte[1024];
+        var responseStream = new MemoryStream();
 
-        await _writer.WriteAsync(BuildRespCommand(command, args));
+        while (!_cancellationTokenSource.IsCancellationRequested)
+        {
+            // Fill our buffer
+            var count = await _stream.ReadAsync(buffer, 0, buffer.Length);
+
+            // We didn't receive anything. Bad things happened.
+            if (count == 0)
+            {
+                throw new EndOfStreamException("The connection was closed by the remote Redis server");
+            }
+
+            // Fill our responseStream with the contents of the buffer
+            responseStream.Write(buffer, 0, count);
+
+            if (responseStream.Length > 1)
+            {
+                // Move our cursor one before the null terminator
+                count--;
+
+                // Check to see if the last two characters were a CRLF
+                if (buffer[count--] == '\n' && buffer[count--] == '\r')
+                {
+                    return Encoding.ASCII.GetString(responseStream.GetBuffer());
+                }
+            }
+        }
+
+        return "";
     }
 
-    public void QueueCommand(string command, params string[] args)
+    /// <summary>
+    ///     Immediately sends a Redis command to the Redis server without reading the response.
+    /// </summary>
+    /// <param name="command">The Redis command to send</param>
+    /// <param name="args">Arguments to provide the Redis command</param>
+    /// <returns>A task that represents the asynchronous command operation</returns>
+    public Task SendAsync(string command, params object[] args)
+    {
+        var bytes = Encoding.ASCII.GetBytes(BuildRespCommand(command, args));
+
+        return _stream.WriteAsync(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>
+    ///     Immediately sends a Redis command to the Redis server without reading the response.
+    /// </summary>
+    /// <param name="respCommand">The Redis RESP formatted command to send</param>
+    /// <returns>A task that represents the asynchronous command operation</returns>
+    public Task SendAsync(string respCommand)
+    {
+        var bytes = Encoding.ASCII.GetBytes(respCommand);
+
+        return _stream.WriteAsync(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>
+    ///     Sends a Redis command to the Redis server and receive the Redis server's response.
+    /// </summary>
+    /// <param name="command">Redis command to send</param>
+    /// <param name="args">Arguments to provide the Redis command</param>
+    /// <returns>A task that represents the asynchronous command operation. The result of the task is the Redis server's response</returns>
+    public async Task<string> ExecuteAsync(string command, params object[] args)
+    {
+        await SendAsync(command, args);
+
+        return await ReceiveResponseAsync();
+    }
+
+    /// <summary>
+    ///     Enqueues a Redis command to be sent to the Reids server.
+    /// </summary>
+    /// <remarks>
+    ///     This command utilizies a backing ConcurrentQueue to store the built messages.
+    ///     A soft limit has been put in the event that something goes wrong and the
+    ///     queue is not able to be empied. The limit is controllable with MaximumQueueSize.
+    /// </remarks>
+    /// <param name="command">Redis command to send</param>
+    /// <param name="args">Arguments to provide the Redis command</param>
+    public void QueueSend(string command, params object[] args)
     {
         if (_queue.Count > MaximumQueueSize)
         {
@@ -259,7 +349,13 @@ public class RedisClient : IDisposable
         _queue.Enqueue(BuildRespCommand(command, args));
     }
 
-    public string BuildRespCommand(string command, params string[] args)
+    /// <summary>
+    ///     Build a message in the RESP format.
+    /// </summary>
+    /// <param name="command">Redis command to build</param>
+    /// <param name="args">Arguments to provide the Redis command</param>
+    /// <returns>A string of the built command</returns>
+    public string BuildRespCommand(string command, params object[] args)
     {
         var builder = new StringBuilder();
 
@@ -283,6 +379,28 @@ public class RedisClient : IDisposable
         return builder.ToString();
     }
 
+    /// <summary>
+    ///     Disconnects the Redis client from the Redis server and releases all network resources.
+    /// </summary>
+    public void Disconnect()
+    {
+        _cancellationTokenSource.Cancel();
+        _client?.Close();
+        _stream?.Dispose();
+
+        OnDisconnected?.Invoke();
+    }
+
+    /// <summary>
+    ///     Attempts to reconnect the Redis client to the Redis server.
+    /// </summary>
+    /// <returns>A task that represents the asynchronous reconnect operation.</returns>
+    public async Task ReconnectAsync()
+    {
+        Disconnect();
+        await ConnectAsync();
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -291,8 +409,8 @@ public class RedisClient : IDisposable
         }
 
         _disposed = true;
-        _cancellationSource.Cancel();
-        _client.Dispose();
+
+        Disconnect();
     }
 }
 
