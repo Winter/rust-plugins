@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using System.Text;
@@ -35,11 +36,9 @@ public class YeetPlugin : CarbonPlugin
 
     public async Task Loaded()
     {
-        _client = new RedisClient(_config.Host, _config.Port, _config.Password)
+        _client = new RedisClient(this)
         {
-            MaximumQueueSize = _config.MaximumQueueSize,
-            ConnectionDelay = TimeSpan.FromMilliseconds(_config.ConnectionDelayMs),
-            DequeueDelay = TimeSpan.FromMilliseconds(_config.DequeueDelayMs)
+            ConnectionRetryDelay = TimeSpan.FromMilliseconds(_config.ConnectionRetryDelayMs)
         };
 
         _client.OnConnected += () =>
@@ -57,12 +56,12 @@ public class YeetPlugin : CarbonPlugin
             Puts($"RedisClient: Disconnected from {_config.Host}:{_config.Port}");
         };
 
-        await _client.ConnectAsync();
+        await _client.ConnectAsync(_config.Host, _config.Port, _config.Password);
     }
 
     public void Unload()
     {
-        _client?.Dispose();
+        _client.Dispose();
     }
 
     public class PluginConfig
@@ -72,7 +71,7 @@ public class YeetPlugin : CarbonPlugin
         public int Port = 6379;
         public string Password = "";
         public int MaximumQueueSize = 100000;
-        public int ConnectionDelayMs = 5000;
+        public int ConnectionRetryDelayMs = 5000;
         public int DequeueDelayMs = 50;
 
         public static bool Validate(CarbonPlugin plugin, PluginConfig config)
@@ -118,21 +117,24 @@ public class YeetPlugin : CarbonPlugin
 /// </summary>
 public class RedisClient : IDisposable
 {
-    private readonly string _host;
-    private readonly int _port;
-    private readonly string _password;
-
-    private readonly ConcurrentQueue<string> _queue;
-
+    private readonly CarbonPlugin _plugin;
+    private readonly ConcurrentQueue<string> _queue = new();
     private CancellationTokenSource _cancellationTokenSource;
-    private TcpClient _client;
+    private Socket _socket;
     private NetworkStream _stream;
+    private StreamReader _reader;
     private bool _disposed;
     private bool _running;
 
-    public int MaximumQueueSize { get; set; } = 100000;
-    public TimeSpan ConnectionDelay { get; set; } = TimeSpan.FromSeconds(5);
-    public TimeSpan DequeueDelay { get; set; } = TimeSpan.FromMilliseconds(50);
+    private string _host;
+    private int _port;
+    private string _password;
+
+    public bool Connected { get; internal set; }
+    public int BatchSizeLimit { get; set; } = 10;
+    public int QueueSizeLimit { get; set; } = 100000;
+    public TimeSpan ConnectionRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
+    public TimeSpan MessageBatchDelay { get; set; } = TimeSpan.FromMilliseconds(5000);
 
     /// <summary>
     ///     Occurs when the Redis client successfully connects
@@ -151,211 +153,259 @@ public class RedisClient : IDisposable
     public event Action OnDisconnected;
 
     /// <summary>
-    /// Occurs when an error occurs in the Redis client
+    ///     Occurs when an error occurs in the Redis client
     /// </summary>    
-    public event Action<Exception> OnError;
+    public event Action<string, Exception> OnError;
+
+    public RedisClient(CarbonPlugin plugin)
+    {
+        _plugin = plugin;
+    }
 
     /// <summary>
-    ///     Initializes a new instance of RedisClient with the specified host and port number.
+    ///     Connects to a Redis instance with the given host, port, and password.
     /// </summary>
-    /// <param name="host">The hostname or IP address of the Redis server.</param>
-    /// <param name="port">The port number on which the Redis server is listening.</param>
-    public RedisClient(
-        string host,
-        int port,
-        string password)
+    /// <param name="host">The host of the Redis instance</param>
+    /// <param name="port">The port number of the Redis instance</param>
+    /// <param name="password">(optional) The password to authenticate with the Redis instance</param>
+    /// <returns>A Task that represents the asynchronous connect operation</returns>
+    public async Task ConnectAsync(string host, int port, string password)
     {
         _host = host;
         _port = port;
         _password = password;
-        _queue = new ConcurrentQueue<string>();
-    }
-
-    /// <summary>
-    ///     Connects the Redis client to the Redis server.
-    /// </summary>
-    /// <returns>A task that represents the asynchronous connect operation.</returns>
-    public async Task ConnectAsync()
-    {
         _cancellationTokenSource = new CancellationTokenSource();
 
         while (!_cancellationTokenSource.IsCancellationRequested)
         {
             try
             {
-                _client = new TcpClient();
-                await _client.ConnectAsync(_host, _port);
-                _stream = _client.GetStream();
+                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await _socket.ConnectAsync(_host, _port);
+                _stream = new NetworkStream(_socket);
+                _reader = new StreamReader(_stream);
 
                 if (_password is not null)
                 {
-                    // Send our password to the Redis server
-                    var result = await ExecuteAsync("AUTH", _password);
+                    var response = await ExecuteCommandAsync("AUTH", _password);
 
-                    if (result.StartsWith("+OK"))
+                    if (response.Type == RedisDataType.Error && response.Data is string error)
                     {
+                        OnError?.Invoke(error, null);
+                        OnDisconnected?.Invoke();
+                        return;
+                    }
+                    else if (response.Type == RedisDataType.SimpleString && response.Data is string data)
+                    {
+                        if (data != "OK")
+                        {
+                            OnError?.Invoke($"Expected 'OK' received {data}", null);
+                            OnDisconnected?.Invoke();
+                            return;
+                        }
+
                         OnAuthenticated?.Invoke();
                     }
-                    else if (result.StartsWith("-ERR"))
-                    {
-                        OnError?.Invoke(new Exception(result));
-
-                        // Wait some time before trying to connect again
-                        await Task.Delay(ConnectionDelay);
-                        continue;
-                    }
                 }
 
-                // We're likely coming from ReconnectAsync. Don't start the SendMessagesAsync loop again.
+                Connected = true;
+                OnConnected?.Invoke();
+
                 if (!_running)
                 {
-                    // Start sending messages from our queue in the background
                     _ = SendMessagesAsync();
                 }
-
-                OnConnected?.Invoke();
 
                 return;
             }
             catch (SocketException)
             {
-                // Wait some time before trying to connect again
-                await Task.Delay(ConnectionDelay);
+                await Task.Delay(ConnectionRetryDelay);
             }
         }
     }
 
+    /// <summary>
+    ///     Continuously sends queued Redis commands in batches, until cancellation is requested.
+    /// </summary>
     public async Task SendMessagesAsync()
     {
         _running = true;
 
         while (!_cancellationTokenSource.IsCancellationRequested)
         {
-            // Apparently, while loops treat their scope like a for loop
-            while (_queue.TryDequeue(out var message))
+            int batchCount = 0;
+
+            while (Connected && batchCount < BatchSizeLimit && _queue.TryDequeue(out var redisCommand))
             {
                 try
                 {
-                    // Send our message
-                    await SendAsync(message);
+                    await SendCommandAsync(redisCommand);
+                    batchCount++;
                 }
-                catch (IOException)
+                catch (SocketException)
                 {
-                    // We've encountered a snag. Attempt to reconnect.
-                    await ReconnectAsync();
+                    await Reconnect();
                 }
             }
 
-            // We've reached the end of our queue. Let's wait.
-            await Task.Delay(DequeueDelay);
+            await Task.Delay(MessageBatchDelay);
         }
     }
 
     /// <summary>
-    ///     Receive a response from the Redis server
+    ///     Sends a Redis command to the Redis server asynchronously.
     /// </summary>
-    /// <returns>A task that represents the asynchronous receive operation. The result of the task is the Redis server's response</returns>
-    /// <exception cref="EndOfStreamException" />
-    public async Task<string> ReceiveResponseAsync()
+    /// <param name="redisCommand">The RESP formatted Redis command to send as a string</param>
+    /// <returns>A task representing the asynchronous operation</returns>
+    /// <exception cref="ArgumentException">Thrown when redisCommand is null</exception>
+    /// <exception cref="SocketException">Thrown when an error occurs when accessing the socket</exception>
+    public Task SendCommandAsync(string redisCommand)
     {
-        var buffer = new byte[1024];
-        var responseStream = new MemoryStream();
-
-        while (!_cancellationTokenSource.IsCancellationRequested)
-        {
-            // Fill our buffer
-            var count = await _stream.ReadAsync(buffer, 0, buffer.Length);
-
-            // We didn't receive anything. Bad things happened.
-            if (count == 0)
-            {
-                throw new EndOfStreamException("The connection was closed by the remote Redis server");
-            }
-
-            // Fill our responseStream with the contents of the buffer
-            responseStream.Write(buffer, 0, count);
-
-            if (responseStream.Length > 1)
-            {
-                // Move our cursor one before the null terminator
-                count--;
-
-                // Check to see if the last two characters were a CRLF
-                if (buffer[count--] == '\n' && buffer[count--] == '\r')
-                {
-                    return Encoding.ASCII.GetString(responseStream.GetBuffer());
-                }
-            }
-        }
-
-        return "";
+        var buffer = Encoding.ASCII.GetBytes(redisCommand);
+        return _socket.SendAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
     }
 
     /// <summary>
-    ///     Immediately sends a Redis command to the Redis server without reading the response.
+    ///     Receives data asynchronously from the Redis server and returns a RedisData object representing the response.
     /// </summary>
-    /// <param name="command">The Redis command to send</param>
-    /// <param name="args">Arguments to provide the Redis command</param>
-    /// <returns>A task that represents the asynchronous command operation</returns>
-    public Task SendAsync(string command, params object[] args)
-    {
-        var bytes = Encoding.ASCII.GetBytes(BuildRespCommand(command, args));
-
-        return _stream.WriteAsync(bytes, 0, bytes.Length);
-    }
-
-    /// <summary>
-    ///     Immediately sends a Redis command to the Redis server without reading the response.
-    /// </summary>
-    /// <param name="respCommand">The Redis RESP formatted command to send</param>
-    /// <returns>A task that represents the asynchronous command operation</returns>
-    public Task SendAsync(string respCommand)
-    {
-        var bytes = Encoding.ASCII.GetBytes(respCommand);
-
-        return _stream.WriteAsync(bytes, 0, bytes.Length);
-    }
-
-    /// <summary>
-    ///     Sends a Redis command to the Redis server and receive the Redis server's response.
-    /// </summary>
-    /// <param name="command">Redis command to send</param>
-    /// <param name="args">Arguments to provide the Redis command</param>
-    /// <returns>A task that represents the asynchronous command operation. The result of the task is the Redis server's response</returns>
-    public async Task<string> ExecuteAsync(string command, params object[] args)
-    {
-        await SendAsync(command, args);
-
-        return await ReceiveResponseAsync();
-    }
-
-    /// <summary>
-    ///     Enqueues a Redis command to be sent to the Reids server.
-    /// </summary>
+    /// <returns>A task representing the RedisData response from the Redis server</returns>
+    /// <exception cref="SocketException">Thrown when an error occurs when accessing the socket</exception>
     /// <remarks>
-    ///     This command utilizies a backing ConcurrentQueue to store the built messages.
-    ///     A soft limit has been put in the event that something goes wrong and the
-    ///     queue is not able to be empied. The limit is controllable with MaximumQueueSize.
+    ///     The response from the Redis server is parsed according to the Redis Serialization Protocol (RESP) 
+    ///     and returned as a RedisData object. The function reads data from the stream until a complete 
+    ///     RedisData object is received, then returns the object to the calling function.
     /// </remarks>
-    /// <param name="command">Redis command to send</param>
-    /// <param name="args">Arguments to provide the Redis command</param>
-    public void QueueSend(string command, params object[] args)
+    public async Task<RedisData> ReceiveAsync()
     {
-        if (_queue.Count > MaximumQueueSize)
+        string data;
+
+        var dataType = _reader.Read() switch
         {
+            '+' => RedisDataType.SimpleString,
+            '-' => RedisDataType.Error,
+            ':' => RedisDataType.Integer,
+            '$' => RedisDataType.BulkString,
+            '*' => RedisDataType.Array,
+            _ => RedisDataType.None
+        };
+
+        switch (dataType)
+        {
+            case RedisDataType.SimpleString:
+            case RedisDataType.Error:
+                data = await _reader.ReadLineAsync();
+                return new RedisData(dataType, data);
+
+            case RedisDataType.Integer:
+                data = await _reader.ReadLineAsync();
+
+                if (!long.TryParse(data, out var integer))
+                {
+                    return new RedisData(RedisDataType.Error, "Unable to parse data 'integer' as long");
+                }
+                return new RedisData(dataType, integer);
+
+            case RedisDataType.BulkString:
+                data = await _reader.ReadLineAsync();
+
+                if (!int.TryParse(data, out var stringLength))
+                {
+                    return new RedisData(RedisDataType.Error, "Unable to parse data 'string length' as int");
+                }
+
+                // RESP Bulk Strings can return null 
+                if (stringLength == -1)
+                {
+                    return new RedisData(dataType, "");
+                }
+
+                var buffer = new char[stringLength];
+
+                await _reader.ReadAsync(buffer, 0, stringLength);
+                await _reader.ReadLineAsync();
+
+                return new RedisData(dataType, new string(buffer));
+
+            case RedisDataType.Array:
+                data = await _reader.ReadLineAsync();
+
+                if (!int.TryParse(data, out var objectCount))
+                {
+                    return new RedisData(RedisDataType.Error, "Unable to parse data 'object count' as int");
+                }
+
+                if (objectCount == -1)
+                {
+                    return RedisData.None;
+                }
+
+                var list = new List<RedisData>();
+
+                for (var i = 0; i < objectCount; i++)
+                {
+                    list.Add(await ReceiveAsync());
+                }
+                return new RedisData(dataType, list);
+
+            default:
+                return RedisData.None;
+        }
+    }
+
+    /// <summary>
+    ///     Executes a Redis command asynchronously with the specified command name and arguments.
+    /// </summary>
+    /// <param name="commandName">The name of the Redis command</param>
+    /// <param name="args">The arguments for the Redis command</param>
+    /// <returns>A task representing the RedisData response from the Redis server</returns>
+    /// <remarks>
+    ///     The Redis command is created using the CreateRedisCommand function and sent to the Redis 
+    ///     server using the SendCommandAsync function. The response from the Redis server is received 
+    ///     asynchronously using the ReceiveAsync function and returned as a RedisData object.
+    /// </remarks>
+    public async Task<RedisData> ExecuteCommandAsync(string commandName, params string[] args)
+    {
+        var redisCommand = CreateRedisCommand(commandName, args);
+
+        await SendCommandAsync(redisCommand);
+
+        return await ReceiveAsync();
+    }
+
+    /// <summary>
+    ///     Queues a Redis command with the specified command name and arguments to be sent later.
+    /// </summary>
+    /// <param name="commandName">The name of the Redis command</param>
+    /// <param name="args">The arguments for the Redis command</param>
+    /// <remarks>
+    ///     The Redis command is added to a queue to be executed later. If the queue size has been reached, 
+    ///     an error message is sent using the OnError event handler and the command is not added to the queue.
+    ///     Commands that have not been added to the queue are lost and cannot be recovered.
+    /// </remarks>
+    public void QueueCommand(string commandName, params string[] args)
+    {
+        if (_queue.Count > QueueSizeLimit)
+        {
+            OnError?.Invoke("The QueueSizeLimit has been reached", null);
             return;
         }
 
-        _queue.Enqueue(BuildRespCommand(command, args));
+        var redisCommand = CreateRedisCommand(commandName, args);
+        _queue.Enqueue(redisCommand);
     }
 
     /// <summary>
-    ///     Build a message in the RESP format.
+    ///     Creates a Redis command with the specified command name and arguments.
     /// </summary>
-    /// <param name="command">Redis command to build</param>
-    /// <param name="args">Arguments to provide the Redis command</param>
-    /// <returns>A string of the built command</returns>
-    public string BuildRespCommand(string command, params object[] args)
+    /// <param name="commandName">The name of the Redis command</param>
+    /// <param name="args">The arguments for the Redis command</param>
+    /// <returns>A string Redis command formatted to the RESP protocol</returns>
+    /// <remarks>
+    ///     The Redis command is created in the format used by the Redis server protocol (RESP).
+    ///     The format is: "*{number of arguments}\r\n${length of command name}\r\n{command name}\r\n${length of argument}\r\n{argument}\r\n".
+    /// </remarks>
+    public string CreateRedisCommand(string commandName, params string[] args)
     {
         var builder = new StringBuilder();
 
@@ -363,10 +413,10 @@ public class RedisClient : IDisposable
         builder.Append("*" + (args.Length + 1) + "\r\n");
 
         // Append the command length
-        builder.Append("$" + command.Length + "\r\n");
+        builder.Append("$" + commandName.Length + "\r\n");
 
         // Append the command
-        builder.Append(command + "\r\n");
+        builder.Append(commandName + "\r\n");
 
         foreach (string arg in args)
         {
@@ -384,8 +434,10 @@ public class RedisClient : IDisposable
     /// </summary>
     public void Disconnect()
     {
-        _cancellationTokenSource.Cancel();
-        _client?.Close();
+        Connected = false;
+
+        _cancellationTokenSource?.Cancel();
+        _socket?.Close();
         _stream?.Dispose();
 
         OnDisconnected?.Invoke();
@@ -394,13 +446,20 @@ public class RedisClient : IDisposable
     /// <summary>
     ///     Attempts to reconnect the Redis client to the Redis server.
     /// </summary>
-    /// <returns>A task that represents the asynchronous reconnect operation.</returns>
-    public async Task ReconnectAsync()
+    /// <returns>A task that represents the asynchronous reconnect operation</returns>
+    public Task Reconnect()
     {
-        Disconnect();
-        await ConnectAsync();
+        if (Connected)
+        {
+            Disconnect();
+        }
+
+        return ConnectAsync(_host, _port, _password);
     }
 
+    /// <summary>
+    ///     Releases all resources used by the RedisClient instance.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed)
@@ -411,6 +470,30 @@ public class RedisClient : IDisposable
         _disposed = true;
 
         Disconnect();
+    }
+}
+
+public enum RedisDataType
+{
+    None,
+    SimpleString,
+    Error,
+    Integer,
+    BulkString,
+    Array
+}
+
+public class RedisData
+{
+    public static RedisData None => new(RedisDataType.None, null);
+
+    public RedisDataType Type { get; }
+    public object Data { get; }
+
+    public RedisData(RedisDataType type, object data)
+    {
+        Type = type;
+        Data = data;
     }
 }
 
