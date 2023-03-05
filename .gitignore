@@ -22,3 +22,4 @@
 
 !/rust-plugins.csproj
 !/setup.ps1
+!/setup.sh
